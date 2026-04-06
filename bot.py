@@ -5,6 +5,7 @@ import json
 import random
 from datetime import datetime, timezone
 import os
+import aiohttp
 from dotenv import load_dotenv
 
 # ── Chargement config ──────────────────────────────────────────────────────────
@@ -421,6 +422,123 @@ async def pseudo_cmd(interaction: discord.Interaction, pseudo: str):
 
 # ──────────────────────────────────────────────────────────────────────────────
 
+@tree.command(name="historypseudo", description="Affiche l'historique des pseudos d'un joueur Minecraft")
+@app_commands.describe(pseudo="Le pseudo Minecraft actuel ou ancien du joueur")
+async def historypseudo(interaction: discord.Interaction, pseudo: str):
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+
+        # 1) Récupération de l'UUID via l'API Mojang
+        try:
+            mojang_url = f"https://api.mojang.com/users/profiles/minecraft/{pseudo}"
+            async with session.get(mojang_url) as resp:
+                if resp.status == 404:
+                    embed = discord.Embed(
+                        title="❌ Joueur introuvable",
+                        description=f"Le pseudo **{pseudo}** n'existe pas sur Minecraft.",
+                        color=0xE74C3C,
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
+                if resp.status != 200:
+                    raise Exception(f"Statut inattendu : {resp.status}")
+                mojang_data = await resp.json()
+        except Exception as e:
+            embed = discord.Embed(
+                title="❌ Erreur API Mojang",
+                description=f"Impossible de contacter l'API Mojang.\n`{e}`",
+                color=0xE74C3C,
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        uuid_raw     = mojang_data["id"]  # ex: "069a79f444e94726a5befca90e38aaf5"
+        uuid_fmt     = f"{uuid_raw[:8]}-{uuid_raw[8:12]}-{uuid_raw[12:16]}-{uuid_raw[16:20]}-{uuid_raw[20:]}"
+        current_name = mojang_data["name"]
+
+        # 2) Récupération de l'historique via l'API Ashcon
+        try:
+            ashcon_url = f"https://api.ashcon.app/mojang/v2/user/{uuid_raw}"
+            async with session.get(ashcon_url) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Statut inattendu : {resp.status}")
+                ashcon_data = await resp.json()
+        except Exception as e:
+            embed = discord.Embed(
+                title="❌ Erreur API Ashcon",
+                description=f"Impossible de récupérer l'historique.\n`{e}`",
+                color=0xE74C3C,
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+    # 3) Construction de l'embed
+    username_history = ashcon_data.get("username_history", [])
+
+    embed = discord.Embed(
+        title=f"📜 Historique de pseudos — {current_name}",
+        color=0x5865F2,
+    )
+
+    # Tête du joueur via Crafatar
+    avatar_url = f"https://crafatar.com/avatars/{uuid_raw}?size=64&overlay"
+    embed.set_thumbnail(url=avatar_url)
+
+    # UUID formaté
+    embed.add_field(
+        name="🔑 UUID",
+        value=f"`{uuid_fmt}`",
+        inline=False,
+    )
+
+    # Historique des pseudos
+    if not username_history:
+        embed.add_field(
+            name="📋 Historique",
+            value="Aucun historique disponible.",
+            inline=False,
+        )
+    else:
+        history_lines = []
+        total = len(username_history)
+        for i, entry in enumerate(reversed(username_history)):
+            name       = entry.get("username", "?")
+            changed_at = entry.get("changed_at")
+            is_current = (i == 0)
+
+            if changed_at:
+                try:
+                    dt       = datetime.strptime(changed_at[:10], "%Y-%m-%d")
+                    date_str = dt.strftime("%d/%m/%Y")
+                except Exception:
+                    date_str = changed_at[:10]
+                date_part = f" *(depuis le {date_str})*"
+            else:
+                date_part = " *(pseudo d'origine)*"
+
+            prefix = "🟢" if is_current else f"`#{total - i}`"
+            bold   = f"**{name}**" if is_current else name
+            history_lines.append(f"{prefix} {bold}{date_part}")
+
+        embed.add_field(
+            name=f"📋 Historique ({total} pseudo{'s' if total > 1 else ''})",
+            value="\n".join(history_lines),
+            inline=False,
+        )
+
+    # Lien NameMC
+    embed.add_field(
+        name="🔗 Profil NameMC",
+        value=f"[Voir le profil complet](https://namemc.com/profile/{uuid_raw})",
+        inline=False,
+    )
+
+    embed.set_footer(text="Données : Mojang API & Ashcon API  •  Avatar : Crafatar")
+    await interaction.followup.send(embed=embed)
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 @tree.command(name="pick", description="Lance le tirage au sort maintenant")
 async def pick(interaction: discord.Interaction):
     if not is_admin(interaction):
@@ -517,6 +635,7 @@ async def help_cmd(interaction: discord.Interaction):
         name="👥 Commandes Joueurs",
         value=(
             "`/pseudo` — Enregistre ton pseudo Minecraft (**obligatoire !**)\n"
+            "`/historypseudo` — Voir l'historique des pseudos d'un joueur Minecraft\n"
             "`/grades` — Voir tous les grades\n"
         ),
         inline=False,
