@@ -3,26 +3,20 @@ from discord.ext import commands
 from discord import app_commands
 import json
 import random
-import asyncio
-from datetime import datetime
-import os
-
-# ── Chargement config ──────────────────────────────────────────────────────────
+from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
 
+# ── Chargement config ──────────────────────────────────────────────────────────
 load_dotenv()
 
 with open("config.json", "r") as f:
     config = json.load(f)
 
-TOKEN          = os.getenv("DISCORD_TOKEN")
-ADMIN_ROLE_ID  = config["admin_role_id"]   # rôle autorisé à créer des events
+TOKEN         = os.getenv("DISCORD_TOKEN")
+ADMIN_ROLE_ID = config["admin_role_id"]
 
 # ── Grades & priorités ─────────────────────────────────────────────────────────
-#  VIP     → garanti dans les picks (100%)
-#  PRIORITY → double chance dans le tirage (≈50% de chances bonus)
-#  NORMAL  → chance de base
 GRADES = {
     "VIP":      {"label": "👑 VIP",      "color": 0xFFD700, "priority": 2},
     "PRIORITY": {"label": "🔥 Priorité", "color": 0xFF6B00, "priority": 1},
@@ -30,29 +24,10 @@ GRADES = {
 }
 
 # ── Stockage en mémoire ────────────────────────────────────────────────────────
-# Structure d'un event actif :
-# {
-#   "guild_id": {
-#       "message_id": int,
-#       "channel_id": int,
-#       "slots": int,
-#       "mode": str,           # "All Stars UHC" etc.
-#       "host": str,
-#       "date": str,
-#       "pick_time": str,
-#       "docs_url": str,
-#       "rules_url": str,
-#       "participants": {user_id: grade},
-#       "picked": [user_id],
-#       "picking_done": bool,
-#   }
-# }
 active_events: dict = {}
+user_grades:   dict = {}
 
-# Grades attribués aux users : {guild_id: {user_id: grade}}
-user_grades: dict = {}
-
-# ── Persistance JSON simple ────────────────────────────────────────────────────
+# ── Persistance JSON ───────────────────────────────────────────────────────────
 GRADES_FILE = "grades.json"
 
 def load_grades():
@@ -60,7 +35,6 @@ def load_grades():
     if os.path.exists(GRADES_FILE):
         with open(GRADES_FILE, "r") as f:
             raw = json.load(f)
-        # clés JSON sont des strings → on convertit en int
         user_grades = {int(g): {int(u): v for u, v in users.items()} for g, users in raw.items()}
 
 def save_grades():
@@ -70,10 +44,10 @@ def save_grades():
 # ── Bot setup ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
-intents.reactions = True
-intents.members = True
+intents.reactions       = True
+intents.members         = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot  = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -85,73 +59,96 @@ def is_admin(interaction: discord.Interaction) -> bool:
 def get_grade(guild_id: int, user_id: int) -> str:
     return user_grades.get(guild_id, {}).get(user_id, "NORMAL")
 
+def format_countdown(pick_time_str: str) -> str:
+    """Essaie de calculer un countdown depuis la chaîne pick_time."""
+    formats = [
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %Hh%M",
+        "%d/%m/%Y %Hh",
+        "%Y-%m-%d %H:%M",
+    ]
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(pick_time_str.strip(), fmt)
+            diff = dt - now
+            total = int(diff.total_seconds())
+            if total > 0:
+                h, rem = divmod(total, 3600)
+                m = rem // 60
+                if h > 0:
+                    return f"{pick_time_str} *(dans {h}h{m:02d})*"
+                return f"{pick_time_str} *(dans {m} minutes)*"
+        except ValueError:
+            continue
+    return pick_time_str
+
 def build_embed(guild_id: int) -> discord.Embed:
     ev = active_events[guild_id]
-    grade_info = GRADES["VIP"]
-    embed = discord.Embed(
-        title="🎮 Game UHC",
-        color=grade_info["color"],
-    )
-    embed.add_field(name="🎮 Mode de Jeu", value=ev["mode"],    inline=False)
-    embed.add_field(name="👑 Host",        value=ev["host"],    inline=True)
+
+    # Couleur orange vif comme la référence
+    embed = discord.Embed(color=0xFF6B00)
+
+    # Description style bullet points
+    lines = []
+    lines.append(f"🎮 · Mode de Jeu : **{ev['mode']}**")
+    lines.append(f"👑 · Host : **{ev['host']}**")
     if ev.get("docs_url"):
-        embed.add_field(name="📖 Documents", value=f"[Ouvrir]({ev['docs_url']})", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=False)
-    embed.add_field(name="📅 Date & Heure", value=ev["date"],       inline=True)
-    embed.add_field(name="⏰ Pick",         value=ev["pick_time"],   inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=False)
-    embed.add_field(name="🎟️ Slots",        value=str(ev["slots"]),                          inline=True)
-    embed.add_field(name="👥 Participants", value=str(len(ev["participants"])),               inline=True)
+        lines.append(f"📖 · Documents : **[{ev['docs_url']}]({ev['docs_url']})**")
+    lines.append("")
+    lines.append(f"📅 · Date et heure : **{ev['date']}**")
+    lines.append(f"⏰ · Pick : **{format_countdown(ev['pick_time'])}**")
+    lines.append("")
+    lines.append(f"🎟️ · Slots : **{ev['slots']}**")
+    lines.append(f"👥 · Participants : **{len(ev['participants'])}**")
+
+    # Grades inscrits
+    vips    = [f"<@{u}>" for u, g in ev["participants"].items() if g == "VIP"]
+    prios   = [f"<@{u}>" for u, g in ev["participants"].items() if g == "PRIORITY"]
+    normals = [f"<@{u}>" for u, g in ev["participants"].items() if g == "NORMAL"]
+
+    if vips or prios or normals:
+        lines.append("")
+        if vips:
+            lines.append("👑 **VIP (garanti)** : " + ", ".join(vips))
+        if prios:
+            lines.append("🔥 **Priorité** : " + ", ".join(prios))
+        if normals:
+            lines.append("👤 **Normal** : " + ", ".join(normals))
+
     if ev.get("rules_url"):
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
-        embed.add_field(name="📜 Règles", value=f"[Voir les règles]({ev['rules_url']})", inline=False)
+        lines.append("")
+        lines.append(f"➡️ Règles : **[{ev['rules_url']}]({ev['rules_url']})**")
 
-    # Liste participants par grade
-    vips      = [f"<@{u}>" for u, g in ev["participants"].items() if g == "VIP"]
-    prios     = [f"<@{u}>" for u, g in ev["participants"].items() if g == "PRIORITY"]
-    normals   = [f"<@{u}>" for u, g in ev["participants"].items() if g == "NORMAL"]
+    embed.description = "\n".join(lines)
 
-    parts_lines = []
-    if vips:
-        parts_lines.append("👑 **VIP (garanti)** : " + ", ".join(vips))
-    if prios:
-        parts_lines.append("🔥 **Priorité** : " + ", ".join(prios))
-    if normals:
-        parts_lines.append("👤 **Normal** : " + ", ".join(normals))
+    # Image optionnelle
+    if ev.get("image_url"):
+        embed.set_image(url=ev["image_url"])
 
-    if parts_lines:
-        embed.add_field(name="📋 Inscrits", value="\n".join(parts_lines), inline=False)
-
-    embed.set_footer(text="✅ Pour rejoindre | ❌ Pour quitter | 🎲 Admission par tirage au sort")
+    embed.set_footer(text="🎲 Admission via un tirage au sort")
     return embed
 
+# ── Tirage au sort ─────────────────────────────────────────────────────────────
 async def do_pick(guild_id: int, channel: discord.TextChannel):
-    """Lance le tirage au sort et annonce les picks."""
     ev = active_events[guild_id]
     if ev["picking_done"]:
         return
     ev["picking_done"] = True
 
-    slots = ev["slots"]
-    participants = ev["participants"]  # {user_id: grade}
+    slots        = ev["slots"]
+    participants = ev["participants"]
 
-    # Séparer VIP / autres
     vips    = [uid for uid, g in participants.items() if g == "VIP"]
     prios   = [uid for uid, g in participants.items() if g == "PRIORITY"]
     normals = [uid for uid, g in participants.items() if g == "NORMAL"]
 
-    picked = []
-
-    # 1. VIPs → toujours pick
-    picked.extend(vips)
-
+    picked = list(vips)
     remaining_slots = slots - len(picked)
     if remaining_slots <= 0:
-        # Plus de place même pour les VIPs → on tronque
         picked = picked[:slots]
         remaining_slots = 0
 
-    # 2. Pool pondéré : PRIORITY compte double, NORMAL simple
     pool = prios * 2 + normals
     random.shuffle(pool)
 
@@ -166,7 +163,6 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
 
     ev["picked"] = picked
 
-    # Annonce
     embed = discord.Embed(
         title="🎲 Résultats du tirage !",
         description=f"**{len(picked)}/{slots}** joueurs sélectionnés",
@@ -177,8 +173,10 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
     if picked:
         embed.add_field(
             name="✅ Joueurs retenus",
-            value="\n".join(f"{'👑' if g=='VIP' else '🔥' if g=='PRIORITY' else '🎮'} <@{uid}>"
-                            for uid, g in [(u, participants.get(u, 'NORMAL')) for u in picked]),
+            value="\n".join(
+                f"{'👑' if participants.get(u)=='VIP' else '🔥' if participants.get(u)=='PRIORITY' else '🎮'} <@{u}>"
+                for u in picked
+            ),
             inline=False,
         )
 
@@ -200,10 +198,11 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
     slots="Nombre de slots disponibles",
     mode="Mode de jeu (ex: All Stars UHC)",
     host="Nom du host",
-    date="Date et heure de la game (ex: lundi 6 avril 2026 16:00)",
-    pick_time="Heure du pick (ex: lundi 6 avril 2026 15:00)",
+    date="Date et heure de la game (ex: lundi 6 avril 2026 18:00)",
+    pick_time="Heure du pick (ex: 06/04/2026 17:00)",
     docs_url="Lien vers les documents (optionnel)",
     rules_url="Lien vers les règles (optionnel)",
+    image_url="Lien vers une image à afficher (optionnel)",
 )
 async def createevent(
     interaction: discord.Interaction,
@@ -212,11 +211,12 @@ async def createevent(
     host: str,
     date: str,
     pick_time: str,
-    docs_url: str = "",
+    docs_url:  str = "",
     rules_url: str = "",
+    image_url: str = "",
 ):
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Tu n'as pas la permission de faire ça.", ephemeral=True)
+        await interaction.response.send_message("❌ Tu n'as pas la permission.", ephemeral=True)
         return
 
     guild_id = interaction.guild_id
@@ -234,6 +234,7 @@ async def createevent(
         "pick_time":    pick_time,
         "docs_url":     docs_url,
         "rules_url":    rules_url,
+        "image_url":    image_url,
         "participants": {},
         "picked":       [],
         "picking_done": False,
@@ -241,7 +242,7 @@ async def createevent(
 
     await interaction.response.defer()
     embed = build_embed(guild_id)
-    msg = await interaction.followup.send(embed=embed)
+    msg   = await interaction.followup.send(embed=embed)
 
     active_events[guild_id]["message_id"] = msg.id
     await msg.add_reaction("✅")
@@ -261,8 +262,7 @@ async def pick(interaction: discord.Interaction):
         return
 
     await interaction.response.send_message("🎲 Tirage en cours...", ephemeral=True)
-    channel = interaction.channel
-    await do_pick(guild_id, channel)
+    await do_pick(guild_id, interaction.channel)
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -283,10 +283,7 @@ async def closeevent(interaction: discord.Interaction):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @tree.command(name="setgrade", description="Attribue un grade à un joueur")
-@app_commands.describe(
-    user="Le joueur",
-    grade="VIP (garanti), PRIORITY (double chance) ou NORMAL",
-)
+@app_commands.describe(user="Le joueur", grade="VIP, PRIORITY ou NORMAL")
 @app_commands.choices(grade=[
     app_commands.Choice(name="👑 VIP — Garanti pick",       value="VIP"),
     app_commands.Choice(name="🔥 Priorité — Double chance", value="PRIORITY"),
@@ -316,7 +313,7 @@ async def setgrade(interaction: discord.Interaction, user: discord.Member, grade
 @tree.command(name="grades", description="Affiche la liste des grades sur ce serveur")
 async def grades_list(interaction: discord.Interaction):
     guild_id = interaction.guild_id
-    gdata = user_grades.get(guild_id, {})
+    gdata    = user_grades.get(guild_id, {})
 
     if not gdata:
         await interaction.response.send_message("Aucun grade attribué pour l'instant.", ephemeral=True)
@@ -359,24 +356,21 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="👥 Commandes Joueurs",
-        value=(
-            "`/participants` — Voir les inscrits\n"
-            "`/grades` — Voir tous les grades\n"
-        ),
+        value=("`/participants` — Voir les inscrits\n""`/grades` — Voir tous les grades\n"),
         inline=False,
     )
     embed.add_field(
         name="🎖️ Système de Grades",
         value=(
             "**👑 VIP** — Toujours pick (100% garanti)\n"
-            "**🔥 Priorité** — Double chance dans le tirage (~50% bonus)\n"
+            "**🔥 Priorité** — Double chance dans le tirage\n"
             "**👤 Normal** — Chance de base\n"
         ),
         inline=False,
     )
     embed.add_field(
         name="✅ ❌ Réactions",
-        value="Réagis ✅ sur le message de l'event pour t'inscrire, ❌ pour te désinscrire.",
+        value="Réagis ✅ pour t'inscrire, ❌ pour te désinscrire.",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -384,7 +378,6 @@ async def help_cmd(interaction: discord.Interaction):
 # ── Gestion des réactions ──────────────────────────────────────────────────────
 
 async def refresh_event_message(guild_id: int):
-    """Met à jour l'embed de l'event avec le nouveau compteur."""
     ev = active_events.get(guild_id)
     if not ev:
         return
@@ -402,7 +395,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     guild_id = payload.guild_id
-    ev = active_events.get(guild_id)
+    ev       = active_events.get(guild_id)
     if not ev or payload.message_id != ev["message_id"]:
         return
 
@@ -421,11 +414,10 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         return
 
     guild_id = payload.guild_id
-    ev = active_events.get(guild_id)
+    ev       = active_events.get(guild_id)
     if not ev or payload.message_id != ev["message_id"]:
         return
 
-    # Si quelqu'un retire son ✅ → le sortir des participants
     if str(payload.emoji) == "✅":
         ev["participants"].pop(payload.user_id, None)
         await refresh_event_message(guild_id)
