@@ -418,10 +418,16 @@ async def pseudo_cmd(interaction: discord.Interaction, pseudo: str):
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-@tree.command(name="historypseudo", description="Affiche l'historique des pseudos d'un joueur Minecraft")
+@tree.command(name="historypseudo", description="[ADMIN] Affiche l'historique des pseudos d'un joueur Minecraft")
 @app_commands.describe(pseudo="Le pseudo Minecraft actuel ou ancien du joueur")
 async def historypseudo(interaction: discord.Interaction, pseudo: str):
-    await interaction.response.defer()
+
+    # ── Vérification permission admin ──
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -439,7 +445,7 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
                         description=f"Le pseudo **{pseudo}** n'existe pas sur Minecraft.",
                         color=0xE74C3C,
                     )
-                    await interaction.followup.send(embed=embed)
+                    await interaction.followup.send(embed=embed, ephemeral=True)
                     return
                 if resp.status != 200:
                     raise Exception(f"Statut inattendu : {resp.status}")
@@ -450,7 +456,7 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
                 description=f"Impossible de contacter l'API Mojang.\n`{e}`",
                 color=0xE74C3C,
             )
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         uuid_raw     = mojang_data["id"]
@@ -467,7 +473,7 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
                     laby_data = await resp.json()
                     for entry in laby_data:
                         name       = entry.get("name", "?")
-                        changed_at = entry.get("changed_at")  # timestamp ms ou null
+                        changed_at = entry.get("changed_at")
                         if changed_at:
                             try:
                                 dt       = datetime.utcfromtimestamp(changed_at / 1000)
@@ -480,7 +486,6 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
                 else:
                     raise Exception(f"Statut Laby.net : {resp.status}")
         except Exception:
-            # Fallback Ashcon
             source = "Ashcon"
             try:
                 ashcon_url = f"https://api.ashcon.app/mojang/v2/user/{uuid_raw}"
@@ -550,7 +555,7 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
     )
 
     embed.set_footer(text=f"Données : Mojang API & {source}  •  Avatar : Crafatar")
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -643,6 +648,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/pick` — Lance le tirage + crée le channel Liste\n"
             "`/closeevent` — Ferme l'event en cours\n"
             "`/setgrade @user grade` — Attribue un grade\n"
+            "`/historypseudo` — Voir l'historique des pseudos d'un joueur Minecraft\n"
         ),
         inline=False,
     )
@@ -650,7 +656,6 @@ async def help_cmd(interaction: discord.Interaction):
         name="👥 Commandes Joueurs",
         value=(
             "`/pseudo` — Enregistre ton pseudo Minecraft (**obligatoire !**)\n"
-            "`/historypseudo` — Voir l'historique des pseudos d'un joueur Minecraft\n"
             "`/grades` — Voir tous les grades\n"
         ),
         inline=False,
