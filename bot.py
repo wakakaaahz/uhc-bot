@@ -16,6 +16,9 @@ with open("config.json", "r") as f:
 TOKEN         = os.getenv("DISCORD_TOKEN")
 ADMIN_ROLE_ID = config["admin_role_id"]
 
+# Lien documents fixe
+DOCS_URL = "https://all-stars-arena.gitbook.io/alls-stars-arena/alls-stars-arena-1"
+
 # ── Grades & priorités ─────────────────────────────────────────────────────────
 GRADES = {
     "VIP":      {"label": "👑 VIP",      "color": 0xFFD700, "priority": 2},
@@ -26,7 +29,7 @@ GRADES = {
 # ── Stockage en mémoire ────────────────────────────────────────────────────────
 active_events: dict = {}
 user_grades:   dict = {}
-user_pseudos:  dict = {}  # {guild_id: {user_id: "PseudoMC"}}
+user_pseudos:  dict = {}
 
 # ── Persistance JSON ───────────────────────────────────────────────────────────
 GRADES_FILE  = "grades.json"
@@ -56,6 +59,9 @@ def save_pseudos():
 
 def get_pseudo(guild_id: int, user_id: int):
     return user_pseudos.get(guild_id, {}).get(user_id)
+
+def has_pseudo(guild_id: int, user_id: int) -> bool:
+    return user_id in user_pseudos.get(guild_id, {})
 
 # ── Bot setup ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -107,27 +113,13 @@ def build_embed(guild_id: int) -> discord.Embed:
     lines.append(f"🎮 · **Mode de Jeu :** {ev['mode']}")
     host_display = f"<@{ev['host_id']}>" if ev.get("host_id") else ev["host"]
     lines.append(f"👑 · **Host :** {host_display}")
-    if ev.get("docs_url"):
-        lines.append(f"📖 · **Documents :** [{ev['docs_url']}]({ev['docs_url']})")
+    lines.append(f"📖 · **Documents :** [Ouvrir le document]({DOCS_URL})")
     lines.append("")
     lines.append(f"📅 · **Date et heure :** {ev['date']}")
     lines.append(f"⏰ · **Pick :** {format_countdown(ev['pick_time'])}")
     lines.append("")
     lines.append(f"🎟️ · **Slots :** {ev['slots']}")
     lines.append(f"👥 · **Participants :** {len(ev['participants'])}")
-
-    vips    = [(u, g) for u, g in ev["participants"].items() if g == "VIP"]
-    prios   = [(u, g) for u, g in ev["participants"].items() if g == "PRIORITY"]
-    normals = [(u, g) for u, g in ev["participants"].items() if g == "NORMAL"]
-
-    if vips or prios or normals:
-        lines.append("")
-        if vips:
-            lines.append("👑 **VIP (garanti)** : " + ", ".join(f"<@{u}>" for u, _ in vips))
-        if prios:
-            lines.append("🔥 **Priorité** : " + ", ".join(f"<@{u}>" for u, _ in prios))
-        if normals:
-            lines.append("👤 **Normal** : " + ", ".join(f"<@{u}>" for u, _ in normals))
 
     if ev.get("rules_url"):
         lines.append("")
@@ -138,7 +130,7 @@ def build_embed(guild_id: int) -> discord.Embed:
     if ev.get("image_url"):
         embed.set_image(url=ev["image_url"])
 
-    embed.set_footer(text="🎲 Admission via un tirage au sort")
+    embed.set_footer(text="🎲 Admission via un tirage au sort  •  Fais /pseudo avant de t'inscrire !")
     return embed
 
 # ── Vue avec boutons ───────────────────────────────────────────────────────────
@@ -153,9 +145,22 @@ class EventView(discord.ui.View):
         if not ev:
             await interaction.response.send_message("❌ Aucun event en cours.", ephemeral=True)
             return
+
+        # ── Pseudo obligatoire ──
+        if not has_pseudo(self.guild_id, interaction.user.id):
+            await interaction.response.send_message(
+                "❌ Tu dois d'abord enregistrer ton pseudo Minecraft avec `/pseudo` avant de rejoindre !",
+                ephemeral=True
+            )
+            return
+
         grade = get_grade(self.guild_id, interaction.user.id)
         ev["participants"][interaction.user.id] = grade
-        await interaction.response.send_message("✅ Tu es bien inscrit à l'event !", ephemeral=True)
+        pseudo = get_pseudo(self.guild_id, interaction.user.id)
+        await interaction.response.send_message(
+            f"✅ Tu es bien inscrit avec le pseudo **{pseudo}** !",
+            ephemeral=True
+        )
         await refresh_event_message(self.guild_id)
 
     @discord.ui.button(label="Quitter", emoji="❌", style=discord.ButtonStyle.danger, custom_id="leave_event")
@@ -174,8 +179,31 @@ class EventView(discord.ui.View):
         if not ev:
             await interaction.response.send_message("❌ Aucun event en cours.", ephemeral=True)
             return
-        embed = build_embed(self.guild_id)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        participants = ev["participants"]
+        if not participants:
+            await interaction.response.send_message("Aucun participant pour l'instant.", ephemeral=True)
+            return
+
+        vips    = [(u, g) for u, g in participants.items() if g == "VIP"]
+        prios   = [(u, g) for u, g in participants.items() if g == "PRIORITY"]
+        normals = [(u, g) for u, g in participants.items() if g == "NORMAL"]
+
+        lines = [f"**📋 Participants ({len(participants)}/{ev['slots']})**\n"]
+
+        def fmt(u):
+            pseudo = get_pseudo(interaction.guild_id, u)
+            ig = f" *(IG: {pseudo})*" if pseudo else ""
+            return f"<@{u}>{ig}"
+
+        if vips:
+            lines.append("👑 **VIP (garanti)** :\n" + "\n".join(fmt(u) for u, _ in vips))
+        if prios:
+            lines.append("🔥 **Priorité** :\n" + "\n".join(fmt(u) for u, _ in prios))
+        if normals:
+            lines.append("👤 **Normal** :\n" + "\n".join(fmt(u) for u, _ in normals))
+
+        await interaction.response.send_message("\n\n".join(lines), ephemeral=True)
 
 # ── Tirage au sort ─────────────────────────────────────────────────────────────
 async def do_pick(guild_id: int, channel: discord.TextChannel):
@@ -218,6 +246,7 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
         ig     = f" **(IG: {pseudo})**" if pseudo else ""
         return f"{emoji} <@{uid}>{ig}"
 
+    # ── Embed résultats dans le channel de l'event ──
     embed = discord.Embed(
         title="🎲 Résultats du tirage !",
         description=f"**{len(picked)}/{slots}** joueurs sélectionnés",
@@ -243,6 +272,37 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
     embed.set_footer(text="Bonne chance à tous ! ⚔️")
     await channel.send(embed=embed)
 
+    # ── Création du channel "Liste" ──
+    guild = bot.get_guild(guild_id)
+    if guild:
+        category = None
+        if ev.get("category_id"):
+            category = guild.get_channel(ev["category_id"])
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                send_messages=False,
+                read_messages=True
+            )
+        }
+
+        liste_channel = await guild.create_text_channel(
+            name="liste",
+            category=category,
+            overwrites=overwrites,
+            topic=f"Liste des joueurs pick pour {ev['mode']}"
+        )
+
+        lines = [f"# 📋 Liste des joueurs — {ev['mode']}\n"]
+        for i, uid in enumerate(picked, 1):
+            pseudo = get_pseudo(guild_id, uid)
+            grade  = participants.get(uid, "NORMAL")
+            emoji  = "👑" if grade == "VIP" else "🔥" if grade == "PRIORITY" else "🎮"
+            ig     = f"**{pseudo}**" if pseudo else "*pseudo non renseigné*"
+            lines.append(f"{i}. {emoji} <@{uid}> → {ig}")
+
+        await liste_channel.send("\n".join(lines))
+
 # ── Refresh embed ──────────────────────────────────────────────────────────────
 async def refresh_event_message(guild_id: int):
     ev = active_events.get(guild_id)
@@ -261,11 +321,10 @@ async def refresh_event_message(guild_id: int):
 @tree.command(name="createevent", description="Crée un event UHC avec inscriptions")
 @app_commands.describe(
     slots="Nombre de slots disponibles",
-    mode="Mode de jeu (ex: All Stars UHC)",
+    mode="Mode de jeu (ex: AllStars)",
     host="Mentionne le host (@user)",
     date="Date et heure de la game (ex: lundi 6 avril 2026 18:00)",
-    pick_time="Heure du pick (ex: 06/04/2026 17:00)",
-    docs_url="Lien vers les documents (optionnel)",
+    pick_time="Heure du pick format JJ/MM/AAAA HH:MM (ex: 06/04/2026 17:00)",
     rules_url="Lien vers les règles (optionnel)",
     image_url="Lien vers une image (optionnel)",
 )
@@ -276,7 +335,6 @@ async def createevent(
     host: discord.Member,
     date: str,
     pick_time: str,
-    docs_url:  str = "",
     rules_url: str = "",
     image_url: str = "",
 ):
@@ -289,8 +347,36 @@ async def createevent(
         await interaction.response.send_message("❌ Un event est déjà en cours ! Fais `/closeevent` d'abord.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+
+    # ── Nom du channel : "allstars-15h" ──
+    try:
+        parts  = pick_time.strip().split(" ")
+        h_part = parts[-1].replace(":", "h")
+        if h_part.endswith("00"):
+            h_part = h_part[:-2]
+    except:
+        h_part = pick_time
+
+    channel_name = f"{mode.replace(' ', '')}-{h_part}".lower()
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            read_messages=True,
+            send_messages=True
+        )
+    }
+
+    event_channel = await guild.create_text_channel(
+        name=channel_name,
+        overwrites=overwrites,
+        topic=f"Event {mode} — Pick à {pick_time}"
+    )
+
     active_events[guild_id] = {
-        "channel_id":   interaction.channel_id,
+        "channel_id":   event_channel.id,
         "message_id":   None,
         "slots":        slots,
         "mode":         mode,
@@ -298,18 +384,22 @@ async def createevent(
         "host_id":      host.id,
         "date":         date,
         "pick_time":    pick_time,
-        "docs_url":     docs_url,
         "rules_url":    rules_url,
         "image_url":    image_url,
         "participants": {},
         "picked":       [],
         "picking_done": False,
+        "category_id":  event_channel.category_id,
     }
 
-    await interaction.response.defer()
     embed = build_embed(guild_id)
-    msg   = await interaction.followup.send(embed=embed, view=EventView(guild_id))
+    msg   = await event_channel.send(embed=embed, view=EventView(guild_id))
     active_events[guild_id]["message_id"] = msg.id
+
+    await interaction.followup.send(
+        f"✅ Event créé dans {event_channel.mention} !",
+        ephemeral=True
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -416,8 +506,8 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="🛠️ Commandes Admin",
         value=(
-            "`/createevent` — Crée un event d'inscription\n"
-            "`/pick` — Lance le tirage au sort\n"
+            "`/createevent` — Crée un event + channel automatique\n"
+            "`/pick` — Lance le tirage + crée le channel Liste\n"
             "`/closeevent` — Ferme l'event en cours\n"
             "`/setgrade @user grade` — Attribue un grade\n"
         ),
@@ -426,7 +516,7 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="👥 Commandes Joueurs",
         value=(
-            "`/pseudo` — Enregistre ton pseudo Minecraft\n"
+            "`/pseudo` — Enregistre ton pseudo Minecraft (**obligatoire !**)\n"
             "`/grades` — Voir tous les grades\n"
         ),
         inline=False,
@@ -442,7 +532,11 @@ async def help_cmd(interaction: discord.Interaction):
     )
     embed.add_field(
         name="✅ ❌ Boutons",
-        value="Clique sur **Rejoindre** pour t'inscrire, **Quitter** pour te désinscrire.",
+        value=(
+            "**Rejoindre** — S'inscrire *(pseudo MC obligatoire)*\n"
+            "**Quitter** — Se désinscrire\n"
+            "**Participants** — Voir la liste des inscrits"
+        ),
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
