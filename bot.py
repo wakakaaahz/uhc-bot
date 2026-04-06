@@ -8,10 +8,15 @@ from datetime import datetime
 import os
 
 # ── Chargement config ──────────────────────────────────────────────────────────
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 with open("config.json", "r") as f:
     config = json.load(f)
 
-TOKEN          = config["token"]
+TOKEN          = os.getenv("DISCORD_TOKEN")
 ADMIN_ROLE_ID  = config["admin_role_id"]   # rôle autorisé à créer des events
 
 # ── Grades & priorités ─────────────────────────────────────────────────────────
