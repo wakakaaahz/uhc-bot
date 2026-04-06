@@ -14,8 +14,9 @@ load_dotenv()
 with open("config.json", "r") as f:
     config = json.load(f)
 
-TOKEN         = os.getenv("DISCORD_TOKEN")
-ADMIN_ROLE_ID = config["admin_role_id"]
+TOKEN          = os.getenv("DISCORD_TOKEN")
+ADMIN_ROLE_ID  = config["admin_role_id"]
+CRAFTY_API_KEY = os.getenv("CRAFTY_API_KEY", "")  # Clé API crafty.gg (optionnelle)
 
 # Lien documents fixe
 DOCS_URL = "https://all-stars-arena.gitbook.io/alls-stars-arena/alls-stars-arena-1"
@@ -107,7 +108,6 @@ def format_countdown(pick_time_str: str) -> str:
 
 def build_embed(guild_id: int) -> discord.Embed:
     ev = active_events[guild_id]
-
     embed = discord.Embed(color=0xFF6B00)
 
     lines = []
@@ -146,14 +146,12 @@ class EventView(discord.ui.View):
         if not ev:
             await interaction.response.send_message("❌ Aucun event en cours.", ephemeral=True)
             return
-
         if not has_pseudo(self.guild_id, interaction.user.id):
             await interaction.response.send_message(
                 "❌ Tu dois d'abord enregistrer ton pseudo Minecraft avec `/pseudo` avant de rejoindre !",
                 ephemeral=True
             )
             return
-
         grade = get_grade(self.guild_id, interaction.user.id)
         ev["participants"][interaction.user.id] = grade
         pseudo = get_pseudo(self.guild_id, interaction.user.id)
@@ -179,7 +177,6 @@ class EventView(discord.ui.View):
         if not ev:
             await interaction.response.send_message("❌ Aucun event en cours.", ephemeral=True)
             return
-
         participants = ev["participants"]
         if not participants:
             await interaction.response.send_message("Aucun participant pour l'instant.", ephemeral=True)
@@ -252,14 +249,12 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
         color=0x2ECC71,
         timestamp=datetime.utcnow(),
     )
-
     if picked:
         embed.add_field(
             name="✅ Joueurs retenus",
             value="\n".join(format_player(u) for u in picked),
             inline=False,
         )
-
     not_picked = [uid for uid in participants if uid not in seen]
     if not_picked:
         embed.add_field(
@@ -267,30 +262,21 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
             value=" ".join(f"<@{uid}>" for uid in not_picked),
             inline=False,
         )
-
     embed.set_footer(text="Bonne chance à tous ! ⚔️")
     await channel.send(embed=embed)
 
     guild = bot.get_guild(guild_id)
     if guild:
-        category = None
-        if ev.get("category_id"):
-            category = guild.get_channel(ev["category_id"])
-
+        category = guild.get_channel(ev["category_id"]) if ev.get("category_id") else None
         overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                send_messages=False,
-                read_messages=True
-            )
+            guild.default_role: discord.PermissionOverwrite(send_messages=False, read_messages=True)
         }
-
         liste_channel = await guild.create_text_channel(
             name="liste",
             category=category,
             overwrites=overwrites,
             topic=f"Liste des joueurs pick pour {ev['mode']}"
         )
-
         lines = [f"# 📋 Liste des joueurs — {ev['mode']}\n"]
         for i, uid in enumerate(picked, 1):
             pseudo = get_pseudo(guild_id, uid)
@@ -298,7 +284,6 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
             emoji  = "👑" if grade == "VIP" else "🔥" if grade == "PRIORITY" else "🎮"
             ig     = f"**{pseudo}**" if pseudo else "*pseudo non renseigné*"
             lines.append(f"{i}. {emoji} <@{uid}> → {ig}")
-
         await liste_channel.send("\n".join(lines))
 
 # ── Refresh embed ──────────────────────────────────────────────────────────────
@@ -313,6 +298,105 @@ async def refresh_event_message(guild_id: int):
         await message.edit(embed=build_embed(guild_id), view=EventView(guild_id))
     except Exception as e:
         print(f"[refresh] Erreur: {e}")
+
+# ── Historique pseudos — logique multi-sources ─────────────────────────────────
+async def fetch_username_history(uuid_raw: str, current_name: str, session: aiohttp.ClientSession):
+    """
+    Tente de récupérer l'historique dans l'ordre :
+    1. Crafty.gg  (le plus complet, nécessite CRAFTY_API_KEY)
+    2. Laby.net
+    3. Ashcon
+    Retourne (history, source) où history = [{"username": str, "date_str": str|None}]
+    """
+
+    # ── 1. Crafty.gg ──────────────────────────────────────────────────────────
+    if CRAFTY_API_KEY:
+        try:
+            headers = {
+                "Authorization": f"Bearer {CRAFTY_API_KEY}",
+                "User-Agent": "UHC-Bot/1.0",
+            }
+            crafty_url = f"https://api.crafty.gg/api/v2/players/{current_name}"
+            async with session.get(crafty_url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # La réponse Crafty contient un champ "username_history" ou "names"
+                    raw_history = (
+                        data.get("data", {}).get("username_history")
+                        or data.get("data", {}).get("names")
+                        or data.get("username_history")
+                        or []
+                    )
+                    if raw_history:
+                        history = []
+                        for entry in raw_history:
+                            name = entry.get("username") or entry.get("name") or "?"
+                            changed_at = entry.get("changed_at") or entry.get("date")
+                            date_str = None
+                            if changed_at:
+                                try:
+                                    # timestamp ms
+                                    dt = datetime.utcfromtimestamp(int(changed_at) / 1000)
+                                    date_str = dt.strftime("%d/%m/%Y")
+                                except Exception:
+                                    try:
+                                        dt = datetime.strptime(str(changed_at)[:10], "%Y-%m-%d")
+                                        date_str = dt.strftime("%d/%m/%Y")
+                                    except Exception:
+                                        pass
+                            history.append({"username": name, "date_str": date_str})
+                        if history:
+                            return history, "Crafty.gg"
+        except Exception as e:
+            print(f"[crafty.gg] Erreur: {e}")
+
+    # ── 2. Laby.net ───────────────────────────────────────────────────────────
+    try:
+        laby_url = f"https://laby.net/api/user/{uuid_raw}/get-names"
+        async with session.get(laby_url) as resp:
+            if resp.status == 200:
+                laby_data = await resp.json()
+                history = []
+                for entry in laby_data:
+                    name       = entry.get("name", "?")
+                    changed_at = entry.get("changed_at")
+                    date_str   = None
+                    if changed_at:
+                        try:
+                            dt       = datetime.utcfromtimestamp(changed_at / 1000)
+                            date_str = dt.strftime("%d/%m/%Y")
+                        except Exception:
+                            pass
+                    history.append({"username": name, "date_str": date_str})
+                if history:
+                    return history, "Laby.net"
+    except Exception as e:
+        print(f"[laby.net] Erreur: {e}")
+
+    # ── 3. Ashcon ─────────────────────────────────────────────────────────────
+    try:
+        ashcon_url = f"https://api.ashcon.app/mojang/v2/user/{uuid_raw}"
+        async with session.get(ashcon_url) as resp:
+            if resp.status == 200:
+                ashcon_data = await resp.json()
+                history = []
+                for entry in ashcon_data.get("username_history", []):
+                    name       = entry.get("username", "?")
+                    changed_at = entry.get("changed_at")
+                    date_str   = None
+                    if changed_at:
+                        try:
+                            dt       = datetime.strptime(changed_at[:10], "%Y-%m-%d")
+                            date_str = dt.strftime("%d/%m/%Y")
+                        except Exception:
+                            pass
+                    history.append({"username": name, "date_str": date_str})
+                if history:
+                    return history, "Ashcon"
+    except Exception as e:
+        print(f"[ashcon] Erreur: {e}")
+
+    return [], "Aucune source"
 
 # ── Slash commands ─────────────────────────────────────────────────────────────
 
@@ -348,24 +432,18 @@ async def createevent(
     await interaction.response.defer(ephemeral=True)
 
     guild = interaction.guild
-
     try:
         parts  = pick_time.strip().split(" ")
         h_part = parts[-1].replace(":", "h")
         if h_part.endswith("00"):
             h_part = h_part[:-2]
-    except:
+    except Exception:
         h_part = pick_time
 
     channel_name = f"{mode.replace(' ', '')}-{h_part}".lower()
-
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            read_messages=True,
-            send_messages=True
-        )
+        guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
     }
-
     event_channel = await guild.create_text_channel(
         name=channel_name,
         overwrites=overwrites,
@@ -393,10 +471,7 @@ async def createevent(
     msg   = await event_channel.send(embed=embed, view=EventView(guild_id))
     active_events[guild_id]["message_id"] = msg.id
 
-    await interaction.followup.send(
-        f"✅ Event créé dans {event_channel.mention} !",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"✅ Event créé dans {event_channel.mention} !", ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -421,16 +496,14 @@ async def pseudo_cmd(interaction: discord.Interaction, pseudo: str):
 @tree.command(name="historypseudo", description="[ADMIN] Affiche l'historique des pseudos d'un joueur Minecraft")
 @app_commands.describe(pseudo="Le pseudo Minecraft actuel ou ancien du joueur")
 async def historypseudo(interaction: discord.Interaction, pseudo: str):
-
-    # ── Vérification permission admin ──
     if not is_admin(interaction):
-        await interaction.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+        await interaction.response.send_message("❌ Tu n'as pas la permission.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "UHC-Bot/1.0 Mozilla/5.0"
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -463,49 +536,8 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
         uuid_fmt     = f"{uuid_raw[:8]}-{uuid_raw[8:12]}-{uuid_raw[12:16]}-{uuid_raw[16:20]}-{uuid_raw[20:]}"
         current_name = mojang_data["name"]
 
-        # 2) Historique via Laby.net (fallback sur Ashcon si échec)
-        username_history = []
-        source = "Laby.net"
-        try:
-            laby_url = f"https://laby.net/api/user/{uuid_raw}/get-names"
-            async with session.get(laby_url) as resp:
-                if resp.status == 200:
-                    laby_data = await resp.json()
-                    for entry in laby_data:
-                        name       = entry.get("name", "?")
-                        changed_at = entry.get("changed_at")
-                        if changed_at:
-                            try:
-                                dt       = datetime.utcfromtimestamp(changed_at / 1000)
-                                date_str = dt.strftime("%d/%m/%Y")
-                            except Exception:
-                                date_str = None
-                        else:
-                            date_str = None
-                        username_history.append({"username": name, "date_str": date_str})
-                else:
-                    raise Exception(f"Statut Laby.net : {resp.status}")
-        except Exception:
-            source = "Ashcon"
-            try:
-                ashcon_url = f"https://api.ashcon.app/mojang/v2/user/{uuid_raw}"
-                async with session.get(ashcon_url) as resp:
-                    if resp.status == 200:
-                        ashcon_data = await resp.json()
-                        for entry in ashcon_data.get("username_history", []):
-                            name       = entry.get("username", "?")
-                            changed_at = entry.get("changed_at")
-                            if changed_at:
-                                try:
-                                    dt       = datetime.strptime(changed_at[:10], "%Y-%m-%d")
-                                    date_str = dt.strftime("%d/%m/%Y")
-                                except Exception:
-                                    date_str = None
-                            else:
-                                date_str = None
-                            username_history.append({"username": name, "date_str": date_str})
-            except Exception:
-                pass
+        # 2) Historique multi-sources
+        username_history, source = await fetch_username_history(uuid_raw, current_name, session)
 
     # 3) Construction de l'embed
     embed = discord.Embed(
@@ -515,31 +547,24 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
 
     avatar_url = f"https://crafatar.com/avatars/{uuid_raw}?size=64&overlay"
     embed.set_thumbnail(url=avatar_url)
-
-    embed.add_field(
-        name="🔑 UUID",
-        value=f"`{uuid_fmt}`",
-        inline=False,
-    )
+    embed.add_field(name="🔑 UUID", value=f"`{uuid_fmt}`", inline=False)
 
     if not username_history:
         embed.add_field(
             name="📋 Historique",
-            value="Aucun historique disponible.",
+            value="Aucun historique disponible (le joueur a peut-être tout caché).",
             inline=False,
         )
     else:
         history_lines = []
         total = len(username_history)
-
         for i, entry in enumerate(reversed(username_history)):
             name       = entry["username"]
             date_str   = entry["date_str"]
             is_current = (i == 0)
-
-            date_part = f" *(depuis le {date_str})*" if date_str else " *(pseudo d'origine)*"
-            prefix    = "🟢" if is_current else f"`#{total - i}`"
-            bold      = f"**{name}**" if is_current else name
+            date_part  = f" *(depuis le {date_str})*" if date_str else " *(pseudo d'origine)*"
+            prefix     = "🟢" if is_current else f"`#{total - i}`"
+            bold       = f"**{name}**" if is_current else name
             history_lines.append(f"{prefix} {bold}{date_part}")
 
         embed.add_field(
@@ -550,7 +575,11 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
 
     embed.add_field(
         name="🔗 Profil",
-        value=f"[Voir sur Laby.net](https://laby.net/@{current_name})  •  [Voir sur NameMC](https://namemc.com/profile/{uuid_raw})",
+        value=(
+            f"[Voir sur Crafty.gg](https://crafty.gg/@{current_name})  •  "
+            f"[Voir sur Laby.net](https://laby.net/@{current_name})  •  "
+            f"[Voir sur NameMC](https://namemc.com/profile/{uuid_raw})"
+        ),
         inline=False,
     )
 
@@ -564,12 +593,10 @@ async def pick(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
         return
-
     guild_id = interaction.guild_id
     if guild_id not in active_events:
         await interaction.response.send_message("❌ Aucun event en cours.", ephemeral=True)
         return
-
     await interaction.response.send_message("🎲 Tirage en cours...", ephemeral=True)
     await do_pick(guild_id, interaction.channel)
 
@@ -580,12 +607,10 @@ async def closeevent(interaction: discord.Interaction):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
         return
-
     guild_id = interaction.guild_id
     if guild_id not in active_events:
         await interaction.response.send_message("❌ Aucun event en cours.", ephemeral=True)
         return
-
     del active_events[guild_id]
     await interaction.response.send_message("✅ Event fermé.", ephemeral=True)
 
@@ -602,13 +627,11 @@ async def setgrade(interaction: discord.Interaction, user: discord.Member, grade
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
         return
-
     guild_id = interaction.guild_id
     if guild_id not in user_grades:
         user_grades[guild_id] = {}
     user_grades[guild_id][user.id] = grade
     save_grades()
-
     info = GRADES[grade]
     embed = discord.Embed(
         title="✅ Grade mis à jour",
@@ -623,17 +646,14 @@ async def setgrade(interaction: discord.Interaction, user: discord.Member, grade
 async def grades_list(interaction: discord.Interaction):
     guild_id = interaction.guild_id
     gdata    = user_grades.get(guild_id, {})
-
     if not gdata:
         await interaction.response.send_message("Aucun grade attribué pour l'instant.", ephemeral=True)
         return
-
     embed = discord.Embed(title="📋 Grades des joueurs", color=0x5865F2)
     for grade_key, info in GRADES.items():
         members = [f"<@{uid}>" for uid, g in gdata.items() if g == grade_key]
         if members:
             embed.add_field(name=info["label"], value=", ".join(members), inline=False)
-
     await interaction.response.send_message(embed=embed)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -648,7 +668,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/pick` — Lance le tirage + crée le channel Liste\n"
             "`/closeevent` — Ferme l'event en cours\n"
             "`/setgrade @user grade` — Attribue un grade\n"
-            "`/historypseudo` — Voir l'historique des pseudos d'un joueur Minecraft\n"
+            "`/historypseudo` — Voir l'historique des pseudos Minecraft\n"
         ),
         inline=False,
     )
