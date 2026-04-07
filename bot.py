@@ -316,7 +316,7 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
                 "Authorization": f"Bearer {CRAFTY_API_KEY}",
                 "User-Agent": "UHC-Bot/1.0",
             }
-            crafty_url = f"https://api.crafty.gg/api/v2/players/{current_name}"
+            crafty_url = f"https://api.crafty.gg/api/v2/players/{uuid_raw}"
             async with session.get(crafty_url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
