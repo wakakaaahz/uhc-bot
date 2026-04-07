@@ -16,7 +16,9 @@ with open("config.json", "r") as f:
 
 TOKEN          = os.getenv("DISCORD_TOKEN")
 ADMIN_ROLE_ID  = config["admin_role_id"]
-CRAFTY_API_KEY = os.getenv("CRAFTY_API_KEY", "")  # Clé API crafty.gg (optionnelle)
+CRAFTY_API_KEY = os.getenv("CRAFTY_API_KEY", "")
+
+print(f"[BOOT] CRAFTY_API_KEY {'✅ chargée' if CRAFTY_API_KEY else '❌ MANQUANTE — vérifier la variable Railway'}")
 
 # Lien documents fixe
 DOCS_URL = "https://all-stars-arena.gitbook.io/alls-stars-arena/alls-stars-arena-1"
@@ -318,24 +320,49 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
             }
             crafty_url = f"https://api.crafty.gg/api/v2/players/{uuid_raw}"
             async with session.get(crafty_url, headers=headers) as resp:
+                print(f"[crafty.gg] Status HTTP : {resp.status}")
+                raw_text = await resp.text()
+                print(f"[crafty.gg] Réponse brute : {raw_text[:500]}")
+
                 if resp.status == 200:
-                    data = await resp.json()
-                    # La réponse Crafty contient un champ "username_history" ou "names"
+                    try:
+                        data = json.loads(raw_text)
+                    except json.JSONDecodeError as e:
+                        print(f"[crafty.gg] JSON invalide : {e}")
+                        data = {}
+
+                    # Cherche le champ historique dans toutes les structures connues
                     raw_history = (
                         data.get("data", {}).get("username_history")
                         or data.get("data", {}).get("names")
+                        or data.get("data", {}).get("previousNames")
                         or data.get("username_history")
+                        or data.get("names")
                         or []
                     )
+                    print(f"[crafty.gg] History extraite ({len(raw_history)} entrées) : {raw_history}")
+
                     if raw_history:
                         history = []
                         for entry in raw_history:
-                            name = entry.get("username") or entry.get("name") or "?"
-                            changed_at = entry.get("changed_at") or entry.get("date")
+                            # Crafty.gg peut renvoyer un simple string ou un dict
+                            if isinstance(entry, str):
+                                history.append({"username": entry, "date_str": None})
+                                continue
+                            name = (
+                                entry.get("username")
+                                or entry.get("name")
+                                or entry.get("value")
+                                or "?"
+                            )
+                            changed_at = (
+                                entry.get("changed_at")
+                                or entry.get("date")
+                                or entry.get("timestamp")
+                            )
                             date_str = None
                             if changed_at:
                                 try:
-                                    # timestamp ms
                                     dt = datetime.utcfromtimestamp(int(changed_at) / 1000)
                                     date_str = dt.strftime("%d/%m/%Y")
                                 except Exception:
@@ -345,10 +372,17 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
                                     except Exception:
                                         pass
                             history.append({"username": name, "date_str": date_str})
+
                         if history:
                             return history, "Crafty.gg"
+                        else:
+                            print("[crafty.gg] History vide après parsing, passage à Laby.net")
+                else:
+                    print(f"[crafty.gg] Statut non-200, passage à Laby.net")
         except Exception as e:
-            print(f"[crafty.gg] Erreur: {e}")
+            print(f"[crafty.gg] Exception : {e}")
+    else:
+        print("[crafty.gg] ❌ Clé API absente — passage direct à Laby.net")
 
     # ── 2. Laby.net ───────────────────────────────────────────────────────────
     try:
