@@ -334,6 +334,7 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
                     # Cherche le champ historique dans toutes les structures connues
                     raw_history = (
                         data.get("data", {}).get("username_history")
+                        or data.get("data", {}).get("usernames")  # ✅ AJOUT ICI
                         or data.get("data", {}).get("names")
                         or data.get("data", {}).get("previousNames")
                         or data.get("username_history")
