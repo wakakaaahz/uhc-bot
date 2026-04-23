@@ -3,6 +3,8 @@ from discord.ext import commands
 from discord import app_commands
 import json
 import random
+import re
+import asyncio
 from datetime import datetime, timezone
 import os
 import aiohttp
@@ -31,14 +33,17 @@ GRADES = {
 }
 
 # ── Stockage en mémoire ────────────────────────────────────────────────────────
-active_events: dict = {}
-user_grades:   dict = {}
-user_pseudos:  dict = {}
+active_events:  dict = {}
+user_grades:    dict = {}   # {guild_id: {user_id: {"grade": str, "expires_at": float|None}}}
+user_pseudos:   dict = {}
+role_chances:   dict = {}   # {guild_id: {role_id: chance_percent}}  ex: {123: {456: 100}}
 
 # ── Persistance JSON ───────────────────────────────────────────────────────────
-GRADES_FILE  = "grades.json"
-PSEUDOS_FILE = "pseudos.json"
+GRADES_FILE      = "grades.json"
+PSEUDOS_FILE     = "pseudos.json"
+ROLE_CHANCES_FILE = "role_chances.json"
 
+# ──────────────── Grades ────────────────
 def load_grades():
     global user_grades
     if os.path.exists(GRADES_FILE):
@@ -50,6 +55,7 @@ def save_grades():
     with open(GRADES_FILE, "w") as f:
         json.dump({str(g): {str(u): v for u, v in users.items()} for g, users in user_grades.items()}, f, indent=2)
 
+# ──────────────── Pseudos ────────────────
 def load_pseudos():
     global user_pseudos
     if os.path.exists(PSEUDOS_FILE):
@@ -67,6 +73,18 @@ def get_pseudo(guild_id: int, user_id: int):
 def has_pseudo(guild_id: int, user_id: int) -> bool:
     return user_id in user_pseudos.get(guild_id, {})
 
+# ──────────────── Rôles & chances ────────────────
+def load_role_chances():
+    global role_chances
+    if os.path.exists(ROLE_CHANCES_FILE):
+        with open(ROLE_CHANCES_FILE, "r") as f:
+            raw = json.load(f)
+        role_chances = {int(g): {int(r): v for r, v in roles.items()} for g, roles in raw.items()}
+
+def save_role_chances():
+    with open(ROLE_CHANCES_FILE, "w") as f:
+        json.dump({str(g): {str(r): v for r, v in roles.items()} for g, roles in role_chances.items()}, f, indent=2)
+
 # ── Bot setup ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -83,7 +101,102 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return any(r.id == ADMIN_ROLE_ID for r in interaction.user.roles)
 
 def get_grade(guild_id: int, user_id: int) -> str:
-    return user_grades.get(guild_id, {}).get(user_id, "NORMAL")
+    """Retourne le grade d'un user. Rétrocompatible avec l'ancien format string."""
+    entry = user_grades.get(guild_id, {}).get(user_id, "NORMAL")
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        expires_at = entry.get("expires_at")
+        if expires_at and datetime.now(timezone.utc).timestamp() > expires_at:
+            return "NORMAL"  # Expiré
+        return entry.get("grade", "NORMAL")
+    return "NORMAL"
+
+def get_role_chance(guild_id: int, member: discord.Member) -> int | None:
+    """
+    Retourne la chance (%) associée au rôle Discord de l'utilisateur le plus prioritaire.
+    Retourne None si aucun rôle configuré.
+    100 = garanti pick, valeurs > 1 = multiplicateur de tickets.
+    """
+    guild_roles = role_chances.get(guild_id, {})
+    if not guild_roles:
+        return None
+    best_chance = None
+    for role in member.roles:
+        if role.id in guild_roles:
+            c = guild_roles[role.id]
+            if best_chance is None or c > best_chance:
+                best_chance = c
+    return best_chance
+
+def parse_duration(duree: str) -> int | None:
+    """Convertit '7j', '24h', '30m', '2j12h30m' en secondes. Retourne None si invalide."""
+    if not duree:
+        return None
+    pattern = re.fullmatch(r"(?:(\d+)j)?(?:(\d+)h)?(?:(\d+)m)?", duree.strip().lower())
+    if not pattern or not any(pattern.groups()):
+        return None
+    days    = int(pattern.group(1) or 0)
+    hours   = int(pattern.group(2) or 0)
+    minutes = int(pattern.group(3) or 0)
+    total   = days * 86400 + hours * 3600 + minutes * 60
+    return total if total > 0 else None
+
+def format_duration(seconds: int) -> str:
+    """Retourne une string lisible depuis des secondes (ex: '2j 12h 30m')."""
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:    parts.append(f"{days}j")
+    if hours:   parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+async def schedule_grade_expiry(guild_id: int, user_id: int, seconds: int):
+    """Attend la durée puis remet le grade à NORMAL automatiquement."""
+    await asyncio.sleep(seconds)
+    if guild_id in user_grades and user_id in user_grades[guild_id]:
+        entry = user_grades[guild_id][user_id]
+        if isinstance(entry, dict) and entry.get("expires_at"):
+            now = datetime.now(timezone.utc).timestamp()
+            if entry["expires_at"] <= now:
+                user_grades[guild_id][user_id] = {"grade": "NORMAL", "expires_at": None}
+                save_grades()
+                print(f"[grade] Grade de {user_id} expiré → remis à NORMAL")
+
+async def reschedule_all_expiries():
+    """Relance les tâches d'expiration au démarrage pour les grades encore actifs."""
+    now = datetime.now(timezone.utc).timestamp()
+    for guild_id, users in user_grades.items():
+        for user_id, entry in users.items():
+            if isinstance(entry, dict) and entry.get("expires_at"):
+                remaining = entry["expires_at"] - now
+                if remaining > 0:
+                    asyncio.create_task(schedule_grade_expiry(guild_id, user_id, int(remaining)))
+                    print(f"[grade] Reprise expiration user {user_id} dans {int(remaining)}s")
+                else:
+                    # Déjà expiré pendant l'absence du bot → on remet NORMAL directement
+                    users[user_id] = {"grade": "NORMAL", "expires_at": None}
+    save_grades()
+
+async def schedule_role_expiry(guild_id: int, user_id: int, role_id: int, seconds: int):
+    """Attend la durée puis retire le rôle Discord à l'utilisateur."""
+    await asyncio.sleep(seconds)
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    member = guild.get_member(user_id)
+    if not member:
+        return
+    role = guild.get_role(role_id)
+    if not role:
+        return
+    try:
+        await member.remove_roles(role, reason="Durée du rôle expirée (bot)")
+        print(f"[role] Rôle {role.name} retiré à {user_id} (expiré)")
+    except Exception as e:
+        print(f"[role] Erreur retrait rôle : {e}")
 
 def format_countdown(pick_time_str: str) -> str:
     formats = [
@@ -204,7 +317,7 @@ class EventView(discord.ui.View):
 
         await interaction.response.send_message("\n\n".join(lines), ephemeral=True)
 
-# ── Tirage au sort ─────────────────────────────────────────────────────────────
+# ── Tirage au sort (mis à jour pour gérer les rôles Discord) ───────────────────
 async def do_pick(guild_id: int, channel: discord.TextChannel):
     ev = active_events[guild_id]
     if ev["picking_done"]:
@@ -213,34 +326,87 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
 
     slots        = ev["slots"]
     participants = ev["participants"]
+    guild        = bot.get_guild(guild_id)
 
-    vips    = [uid for uid, g in participants.items() if g == "VIP"]
-    prios   = [uid for uid, g in participants.items() if g == "PRIORITY"]
-    normals = [uid for uid, g in participants.items() if g == "NORMAL"]
+    # Classement des participants en 3 catégories :
+    # - guaranteed : garanti pick (grade VIP OU rôle Discord à 100%)
+    # - weighted   : list de tuples (uid, poids) pour le tirage pondéré
+    guaranteed = []
+    weighted   = []
 
-    picked = list(vips)
-    remaining_slots = slots - len(picked)
-    if remaining_slots <= 0:
-        picked = picked[:slots]
-        remaining_slots = 0
+    for uid, grade in participants.items():
+        member = guild.get_member(uid) if guild else None
 
-    pool = prios * 2 + normals
-    random.shuffle(pool)
+        # 1. Grade VIP → toujours garanti
+        if grade == "VIP":
+            guaranteed.append(uid)
+            continue
 
-    seen = set(picked)
-    for uid in pool:
-        if remaining_slots <= 0:
-            break
-        if uid not in seen:
-            picked.append(uid)
-            seen.add(uid)
-            remaining_slots -= 1
+        # 2. Rôle Discord configuré → chance personnalisée
+        role_chance = get_role_chance(guild_id, member) if member else None
+        if role_chance is not None:
+            if role_chance >= 100:
+                guaranteed.append(uid)
+            else:
+                # On convertit le pourcentage en poids : 100% normal = 1 ticket
+                # Ex : 50% = 0.5 ticket, 200% = 2 tickets
+                weight = max(1, int(role_chance))
+                weighted.append((uid, weight))
+            continue
+
+        # 3. Grade PRIORITY → 2 tickets
+        if grade == "PRIORITY":
+            weighted.append((uid, 2))
+            continue
+
+        # 4. Normal → 1 ticket
+        weighted.append((uid, 1))
+
+    # On déduplique les garantis
+    guaranteed = list(dict.fromkeys(guaranteed))
+
+    # Tirage pondéré pour les restants
+    picked     = list(guaranteed)
+    remaining  = slots - len(picked)
+
+    if remaining > 0 and weighted:
+        pool_uids    = [uid for uid, _ in weighted]
+        pool_weights = [w   for _, w   in weighted]
+
+        seen    = set(picked)
+        ordered = []
+        temp_pool   = list(zip(pool_uids, pool_weights))
+
+        while remaining > 0 and temp_pool:
+            uids_   = [x[0] for x in temp_pool]
+            weights = [x[1] for x in temp_pool]
+            chosen  = random.choices(uids_, weights=weights, k=1)[0]
+            if chosen not in seen:
+                ordered.append(chosen)
+                seen.add(chosen)
+                remaining -= 1
+            temp_pool = [(u, w) for u, w in temp_pool if u != chosen]
+
+        picked.extend(ordered)
+
+    picked = picked[:slots]
 
     ev["picked"] = picked
 
     def format_player(uid):
         grade  = participants.get(uid, "NORMAL")
-        emoji  = "👑" if grade == "VIP" else "🔥" if grade == "PRIORITY" else "🎮"
+        member = guild.get_member(uid) if guild else None
+        role_chance = get_role_chance(guild_id, member) if member else None
+
+        if grade == "VIP" or (role_chance is not None and role_chance >= 100):
+            emoji = "👑"
+        elif role_chance is not None:
+            emoji = "🎯"
+        elif grade == "PRIORITY":
+            emoji = "🔥"
+        else:
+            emoji = "🎮"
+
         pseudo = get_pseudo(guild_id, uid)
         ig     = f" **(IG: {pseudo})**" if pseudo else ""
         return f"{emoji} <@{uid}>{ig}"
@@ -257,7 +423,7 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
             value="\n".join(format_player(u) for u in picked),
             inline=False,
         )
-    not_picked = [uid for uid in participants if uid not in seen]
+    not_picked = [uid for uid in participants if uid not in set(picked)]
     if not_picked:
         embed.add_field(
             name="❌ Non retenus",
@@ -267,7 +433,6 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
     embed.set_footer(text="Bonne chance à tous ! ⚔️")
     await channel.send(embed=embed)
 
-    guild = bot.get_guild(guild_id)
     if guild:
         category = guild.get_channel(ev["category_id"]) if ev.get("category_id") else None
         overwrites = {
@@ -283,8 +448,17 @@ async def do_pick(guild_id: int, channel: discord.TextChannel):
         for i, uid in enumerate(picked, 1):
             pseudo = get_pseudo(guild_id, uid)
             grade  = participants.get(uid, "NORMAL")
-            emoji  = "👑" if grade == "VIP" else "🔥" if grade == "PRIORITY" else "🎮"
-            ig     = f"**{pseudo}**" if pseudo else "*pseudo non renseigné*"
+            member = guild.get_member(uid)
+            role_chance = get_role_chance(guild_id, member) if member else None
+            if grade == "VIP" or (role_chance is not None and role_chance >= 100):
+                emoji = "👑"
+            elif role_chance is not None:
+                emoji = "🎯"
+            elif grade == "PRIORITY":
+                emoji = "🔥"
+            else:
+                emoji = "🎮"
+            ig = f"**{pseudo}**" if pseudo else "*pseudo non renseigné*"
             lines.append(f"{i}. {emoji} <@{uid}> → {ig}")
         await liste_channel.send("\n".join(lines))
 
@@ -303,15 +477,6 @@ async def refresh_event_message(guild_id: int):
 
 # ── Historique pseudos — logique multi-sources ─────────────────────────────────
 async def fetch_username_history(uuid_raw: str, current_name: str, session: aiohttp.ClientSession):
-    """
-    Tente de récupérer l'historique dans l'ordre :
-    1. Crafty.gg  (le plus complet, nécessite CRAFTY_API_KEY)
-    2. Laby.net
-    3. Ashcon
-    Retourne (history, source) où history = [{"username": str, "date_str": str|None}]
-    """
-
-    # ── 1. Crafty.gg ──────────────────────────────────────────────────────────
     if CRAFTY_API_KEY:
         try:
             headers = {
@@ -323,44 +488,29 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
                 print(f"[crafty.gg] Status HTTP : {resp.status}")
                 raw_text = await resp.text()
                 print(f"[crafty.gg] Réponse brute : {raw_text[:500]}")
-
                 if resp.status == 200:
                     try:
                         data = json.loads(raw_text)
                     except json.JSONDecodeError as e:
                         print(f"[crafty.gg] JSON invalide : {e}")
                         data = {}
-
-                    # Cherche le champ historique dans toutes les structures connues
                     raw_history = (
                         data.get("data", {}).get("username_history")
-                        or data.get("data", {}).get("usernames")  # ✅ AJOUT ICI
+                        or data.get("data", {}).get("usernames")
                         or data.get("data", {}).get("names")
                         or data.get("data", {}).get("previousNames")
                         or data.get("username_history")
                         or data.get("names")
                         or []
                     )
-                    print(f"[crafty.gg] History extraite ({len(raw_history)} entrées) : {raw_history}")
-
                     if raw_history:
                         history = []
                         for entry in raw_history:
-                            # Crafty.gg peut renvoyer un simple string ou un dict
                             if isinstance(entry, str):
                                 history.append({"username": entry, "date_str": None})
                                 continue
-                            name = (
-                                entry.get("username")
-                                or entry.get("name")
-                                or entry.get("value")
-                                or "?"
-                            )
-                            changed_at = (
-                                entry.get("changed_at")
-                                or entry.get("date")
-                                or entry.get("timestamp")
-                            )
+                            name = (entry.get("username") or entry.get("name") or entry.get("value") or "?")
+                            changed_at = (entry.get("changed_at") or entry.get("date") or entry.get("timestamp"))
                             date_str = None
                             if changed_at:
                                 try:
@@ -373,19 +523,13 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
                                     except Exception:
                                         pass
                             history.append({"username": name, "date_str": date_str})
-
                         if history:
                             return history, "Crafty.gg"
-                        else:
-                            print("[crafty.gg] History vide après parsing, passage à Laby.net")
-                else:
-                    print(f"[crafty.gg] Statut non-200, passage à Laby.net")
         except Exception as e:
             print(f"[crafty.gg] Exception : {e}")
     else:
         print("[crafty.gg] ❌ Clé API absente — passage direct à Laby.net")
 
-    # ── 2. Laby.net ───────────────────────────────────────────────────────────
     try:
         laby_url = f"https://laby.net/api/user/{uuid_raw}/get-names"
         async with session.get(laby_url) as resp:
@@ -408,7 +552,6 @@ async def fetch_username_history(uuid_raw: str, current_name: str, session: aioh
     except Exception as e:
         print(f"[laby.net] Erreur: {e}")
 
-    # ── 3. Ashcon ─────────────────────────────────────────────────────────────
     try:
         ashcon_url = f"https://api.ashcon.app/mojang/v2/user/{uuid_raw}"
         async with session.get(ashcon_url) as resp:
@@ -537,13 +680,9 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
 
     await interaction.response.defer(ephemeral=True)
 
-    headers = {
-        "User-Agent": "UHC-Bot/1.0 Mozilla/5.0"
-    }
+    headers = {"User-Agent": "UHC-Bot/1.0 Mozilla/5.0"}
 
     async with aiohttp.ClientSession(headers=headers) as session:
-
-        # 1) UUID via Mojang
         try:
             mojang_url = f"https://api.mojang.com/users/profiles/minecraft/{pseudo}"
             async with session.get(mojang_url) as resp:
@@ -571,10 +710,8 @@ async def historypseudo(interaction: discord.Interaction, pseudo: str):
         uuid_fmt     = f"{uuid_raw[:8]}-{uuid_raw[8:12]}-{uuid_raw[12:16]}-{uuid_raw[16:20]}-{uuid_raw[20:]}"
         current_name = mojang_data["name"]
 
-        # 2) Historique multi-sources
         username_history, source = await fetch_username_history(uuid_raw, current_name, session)
 
-    # 3) Construction de l'embed
     embed = discord.Embed(
         title=f"📜 Historique de pseudos — {current_name}",
         color=0x5865F2,
@@ -651,29 +788,212 @@ async def closeevent(interaction: discord.Interaction):
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-@tree.command(name="setgrade", description="Attribue un grade à un joueur")
-@app_commands.describe(user="Le joueur", grade="VIP, PRIORITY ou NORMAL")
+@tree.command(name="setgrade", description="[ADMIN] Attribue un grade à un joueur")
+@app_commands.describe(
+    user="Le joueur",
+    grade="VIP, PRIORITY ou NORMAL",
+    duree="Durée du grade (ex: 7j, 24h, 30m, 2j12h) — laisser vide = permanent"
+)
 @app_commands.choices(grade=[
     app_commands.Choice(name="👑 VIP — Garanti pick",       value="VIP"),
     app_commands.Choice(name="🔥 Priorité — Double chance", value="PRIORITY"),
     app_commands.Choice(name="👤 Normal — Chance de base",  value="NORMAL"),
 ])
-async def setgrade(interaction: discord.Interaction, user: discord.Member, grade: str):
+async def setgrade(interaction: discord.Interaction, user: discord.Member, grade: str, duree: str = ""):
     if not is_admin(interaction):
         await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
         return
+
     guild_id = interaction.guild_id
     if guild_id not in user_grades:
         user_grades[guild_id] = {}
-    user_grades[guild_id][user.id] = grade
+
+    seconds = parse_duration(duree)
+    if duree and seconds is None:
+        await interaction.response.send_message(
+            "❌ Format de durée invalide. Exemples : `7j`, `24h`, `30m`, `2j12h`",
+            ephemeral=True
+        )
+        return
+
+    expire_ts = (datetime.now(timezone.utc).timestamp() + seconds) if seconds else None
+
+    user_grades[guild_id][user.id] = {"grade": grade, "expires_at": expire_ts}
     save_grades()
-    info = GRADES[grade]
+
+    info      = GRADES[grade]
+    duree_str = format_duration(seconds) if seconds else "**permanent**"
+
     embed = discord.Embed(
         title="✅ Grade mis à jour",
-        description=f"{user.mention} est maintenant **{info['label']}**",
+        description=(
+            f"{user.mention} est maintenant **{info['label']}**\n"
+            f"⏳ Durée : {duree_str}"
+        ),
         color=info["color"],
     )
     await interaction.response.send_message(embed=embed)
+
+    if seconds:
+        asyncio.create_task(schedule_grade_expiry(guild_id, user.id, seconds))
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tree.command(name="setrolechance", description="[ADMIN] Définit le % de chance de pick pour un rôle Discord")
+@app_commands.describe(
+    role="Le rôle Discord concerné",
+    chance="Pourcentage de chance (1-100). 100 = pick garanti, 200 = double chance, etc."
+)
+async def setrolechance(interaction: discord.Interaction, role: discord.Role, chance: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+
+    if chance < 1:
+        await interaction.response.send_message("❌ La chance doit être au moins 1.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild_id
+    if guild_id not in role_chances:
+        role_chances[guild_id] = {}
+
+    role_chances[guild_id][role.id] = chance
+    save_role_chances()
+
+    if chance >= 100:
+        description = f"Le rôle {role.mention} donnera un **pick garanti (100%)** à ses membres."
+        emoji = "👑"
+    else:
+        description = f"Le rôle {role.mention} donnera **{chance} tickets** dans le tirage à ses membres.\n*(Normal = 1 ticket, Priorité = 2 tickets)*"
+        emoji = "🎯"
+
+    embed = discord.Embed(
+        title=f"{emoji} Chance du rôle configurée",
+        description=description,
+        color=role.color if role.color.value != 0 else 0x5865F2,
+    )
+    embed.set_footer(text="Utilisez /listroles pour voir tous les rôles configurés.")
+    await interaction.response.send_message(embed=embed)
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tree.command(name="setrole", description="[ADMIN] Attribue un rôle Discord à un joueur avec une durée optionnelle")
+@app_commands.describe(
+    user="Le joueur",
+    role="Le rôle à attribuer",
+    duree="Durée (ex: 7j, 24h, 30m, 2j12h) — laisser vide = permanent"
+)
+async def setrole(interaction: discord.Interaction, user: discord.Member, role: discord.Role, duree: str = ""):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+
+    seconds = parse_duration(duree)
+    if duree and seconds is None:
+        await interaction.response.send_message(
+            "❌ Format de durée invalide. Exemples : `7j`, `24h`, `30m`, `2j12h`",
+            ephemeral=True
+        )
+        return
+
+    # Vérification que le bot peut attribuer ce rôle
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "❌ Je ne peux pas attribuer ce rôle car il est supérieur ou égal à mon rôle le plus haut.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await user.add_roles(role, reason=f"Attribué par {interaction.user} via /setrole")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas la permission d'attribuer ce rôle.", ephemeral=True)
+        return
+
+    duree_str = format_duration(seconds) if seconds else "**permanent**"
+
+    # Indique si ce rôle a une chance configurée
+    guild_id    = interaction.guild_id
+    guild_roles = role_chances.get(guild_id, {})
+    chance      = guild_roles.get(role.id)
+
+    if chance is not None:
+        if chance >= 100:
+            chance_info = f"\n🎯 Ce rôle donne un **pick garanti** dans les events."
+        else:
+            chance_info = f"\n🎯 Ce rôle donne **{chance} tickets** dans le tirage."
+    else:
+        chance_info = ""
+
+    embed = discord.Embed(
+        title="✅ Rôle attribué",
+        description=(
+            f"{user.mention} a reçu le rôle {role.mention}\n"
+            f"⏳ Durée : {duree_str}"
+            f"{chance_info}"
+        ),
+        color=role.color if role.color.value != 0 else 0x2ECC71,
+    )
+    await interaction.response.send_message(embed=embed)
+
+    if seconds:
+        asyncio.create_task(schedule_role_expiry(guild_id, user.id, role.id, seconds))
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tree.command(name="removerolechance", description="[ADMIN] Supprime la configuration de chance d'un rôle")
+@app_commands.describe(role="Le rôle à retirer de la configuration")
+async def removerolechance(interaction: discord.Interaction, role: discord.Role):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild_id
+    if guild_id not in role_chances or role.id not in role_chances[guild_id]:
+        await interaction.response.send_message(f"❌ Le rôle {role.mention} n'a pas de configuration.", ephemeral=True)
+        return
+
+    del role_chances[guild_id][role.id]
+    save_role_chances()
+
+    embed = discord.Embed(
+        title="🗑️ Configuration supprimée",
+        description=f"Le rôle {role.mention} n'a plus de chance configurée. Ses membres seront traités comme des joueurs **Normaux**.",
+        color=0xE74C3C,
+    )
+    await interaction.response.send_message(embed=embed)
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tree.command(name="listroles", description="[ADMIN] Affiche tous les rôles configurés avec leur chance de pick")
+async def listroles(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ Permission refusée.", ephemeral=True)
+        return
+
+    guild_id    = interaction.guild_id
+    guild_roles = role_chances.get(guild_id, {})
+
+    if not guild_roles:
+        await interaction.response.send_message(
+            "Aucun rôle configuré. Utilisez `/setrolechance` pour en ajouter.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(title="🎯 Rôles configurés — Chances de pick", color=0x5865F2)
+    lines = []
+    for role_id, chance in sorted(guild_roles.items(), key=lambda x: x[1], reverse=True):
+        role = interaction.guild.get_role(role_id)
+        role_str = role.mention if role else f"*(rôle supprimé — ID {role_id})*"
+        if chance >= 100:
+            lines.append(f"👑 {role_str} → **Pick garanti**")
+        else:
+            lines.append(f"🎯 {role_str} → **{chance} tickets** dans le tirage")
+
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Normal = 1 ticket  •  Priorité = 2 tickets  •  VIP = garanti")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -686,7 +1006,7 @@ async def grades_list(interaction: discord.Interaction):
         return
     embed = discord.Embed(title="📋 Grades des joueurs", color=0x5865F2)
     for grade_key, info in GRADES.items():
-        members = [f"<@{uid}>" for uid, g in gdata.items() if g == grade_key]
+        members = [f"<@{uid}>" for uid, entry in gdata.items() if get_grade(guild_id, uid) == grade_key]
         if members:
             embed.add_field(name=info["label"], value=", ".join(members), inline=False)
     await interaction.response.send_message(embed=embed)
@@ -702,7 +1022,11 @@ async def help_cmd(interaction: discord.Interaction):
             "`/createevent` — Crée un event + channel automatique\n"
             "`/pick` — Lance le tirage + crée le channel Liste\n"
             "`/closeevent` — Ferme l'event en cours\n"
-            "`/setgrade @user grade` — Attribue un grade\n"
+            "`/setgrade @user grade [durée]` — Attribue un grade temporaire ou permanent\n"
+            "`/setrole @user role [durée]` — Attribue un rôle Discord temporaire ou permanent\n"
+            "`/setrolechance role chance` — Configure le % de pick d'un rôle\n"
+            "`/removerolechance role` — Supprime la config d'un rôle\n"
+            "`/listroles` — Voir tous les rôles configurés\n"
             "`/historypseudo` — Voir l'historique des pseudos Minecraft\n"
         ),
         inline=False,
@@ -725,11 +1049,31 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="🎯 Système de Rôles",
+        value=(
+            "Les rôles Discord peuvent avoir un % de chance configuré via `/setrolechance`.\n"
+            "**100%** = pick garanti (comme VIP)\n"
+            "**200** = double chance (comme Priorité)\n"
+            "Le rôle le plus avantageux s'applique en priorité sur le grade."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="✅ ❌ Boutons",
         value=(
             "**Rejoindre** — S'inscrire *(pseudo MC obligatoire)*\n"
             "**Quitter** — Se désinscrire\n"
             "**Participants** — Voir la liste des inscrits"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏳ Durées",
+        value=(
+            "Les commandes `/setgrade` et `/setrole` acceptent une durée :\n"
+            "`7j` = 7 jours  •  `24h` = 24 heures  •  `30m` = 30 minutes\n"
+            "Combinaisons possibles : `2j12h30m`\n"
+            "Sans durée = permanent."
         ),
         inline=False,
     )
@@ -741,6 +1085,9 @@ async def help_cmd(interaction: discord.Interaction):
 async def on_ready():
     load_grades()
     load_pseudos()
+    load_role_chances()
+    await reschedule_all_expiries()   # ← Reprend les expirations de grades après redémarrage
+    await bot.load_extension("cogs.moderation")
     await tree.sync()
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
     print("   Slash commands synchronisées.")
